@@ -1,0 +1,24 @@
+# ESP32
+gateway/build/
+gateway/sdkconfig
+gateway/sdkconfig.old
+
+# Next.js
+backend/.next/
+backend/out/
+backend/node_modules/
+backend/.env
+backend/.env.local
+
+# MongoDB
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

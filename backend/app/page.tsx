@@ -14,6 +14,8 @@ export default function Home() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
+  const [gatewayStatus, setGatewayStatus] = useState<"connected" | "disconnected" | "idle">("disconnected");
+  const [lastGatewayHeartbeat, setLastGatewayHeartbeat] = useState<Date | null>(null);
 
   useEffect(() => {
     fetchDevices();
@@ -26,10 +28,36 @@ export default function Home() {
       const res = await fetch("/api/devices");
       const data = await res.json();
       setDevices(data);
+      
+      // Check for gateway heartbeat
+      checkGatewayStatus(data);
     } catch (error) {
       console.error("Failed to fetch devices:", error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const checkGatewayStatus = (deviceList: Device[]) => {
+    // Look for gateway device (device_id starts with "gateway")
+    const gateway = deviceList.find(d => d.device_id.toLowerCase().includes("gateway"));
+    
+    if (gateway) {
+      const lastSeen = new Date(gateway.timestamp);
+      const age = Date.now() - lastSeen.getTime();
+      
+      setLastGatewayHeartbeat(lastSeen);
+      
+      if (age < 60000) {
+        setGatewayStatus("connected");
+      } else if (age < 300000) {
+        setGatewayStatus("idle");
+      } else {
+        setGatewayStatus("disconnected");
+      }
+    } else {
+      setGatewayStatus("disconnected");
+      setLastGatewayHeartbeat(null);
     }
   };
 
@@ -82,10 +110,23 @@ export default function Home() {
       
       <header className="header">
         <div className="header-content">
-          <h1 className="title">
-            <span className="title-main">IoT Hub</span>
-            <span className="title-sub">Device Network Monitor</span>
-          </h1>
+          <div className="header-left">
+            <h1 className="title">
+              <span className="title-main">IoT Hub</span>
+              <span className="title-sub">Device Network Monitor</span>
+            </h1>
+            <div className={`gateway-status ${gatewayStatus}`}>
+              <span className="gateway-dot"></span>
+              <span className="gateway-label">
+                Gateway {gatewayStatus === "connected" ? "Connected" : gatewayStatus === "idle" ? "Idle" : "Disconnected"}
+              </span>
+              {lastGatewayHeartbeat && (
+                <span className="gateway-time">
+                  {new Date(lastGatewayHeartbeat).toLocaleTimeString()}
+                </span>
+              )}
+            </div>
+          </div>
           <div className="stats">
             <div className="stat">
               <span className="stat-value">{devices.length}</span>

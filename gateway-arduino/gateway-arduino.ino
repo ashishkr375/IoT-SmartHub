@@ -28,7 +28,7 @@ const char* WIFI_SSID = "YOUR_WIFI_NAME";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // Backend API Configuration
-const char* API_BASE_URL = "https://smarthublite.vercel.app";
+const char* API_BASE_URL = "https://io-t-smart-hub.vercel.app";
 const char* API_UPDATE_ENDPOINT = "/api/device/update";
 const char* API_COMMAND_ENDPOINT = "/api/device/command";
 

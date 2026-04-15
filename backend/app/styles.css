@@ -72,6 +72,12 @@ body {
   gap: 2rem;
 }
 
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+}
+
 .title {
   display: flex;
   flex-direction: column;
@@ -96,6 +102,92 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.15em;
   font-weight: 400;
+}
+
+/* Gateway Status */
+.gateway-status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: all 0.3s;
+}
+
+.gateway-status.connected {
+  border-color: rgba(0, 255, 136, 0.4);
+  background: rgba(0, 255, 136, 0.05);
+}
+
+.gateway-status.idle {
+  border-color: rgba(255, 193, 7, 0.4);
+  background: rgba(255, 193, 7, 0.05);
+}
+
+.gateway-status.disconnected {
+  border-color: rgba(255, 51, 102, 0.4);
+  background: rgba(255, 51, 102, 0.05);
+}
+
+.gateway-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  position: relative;
+}
+
+.gateway-status.connected .gateway-dot {
+  background: var(--accent-primary);
+  box-shadow: 0 0 12px var(--accent-primary);
+  animation: gatewayPulse 2s ease-in-out infinite;
+}
+
+.gateway-status.idle .gateway-dot {
+  background: #ffc107;
+  box-shadow: 0 0 12px #ffc107;
+  animation: gatewayPulse 3s ease-in-out infinite;
+}
+
+.gateway-status.disconnected .gateway-dot {
+  background: var(--accent-danger);
+  opacity: 0.5;
+}
+
+@keyframes gatewayPulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 0.7;
+  }
+}
+
+.gateway-label {
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.gateway-status.connected .gateway-label {
+  color: var(--accent-primary);
+}
+
+.gateway-status.idle .gateway-label {
+  color: #ffc107;
+}
+
+.gateway-status.disconnected .gateway-label {
+  color: var(--accent-danger);
+}
+
+.gateway-time {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
 }
 
 .stats {
@@ -447,6 +539,11 @@ body {
     flex-wrap: wrap;
   }
 
+  .header-left {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .stats {
     width: 100%;
     justify-content: space-between;
@@ -458,6 +555,12 @@ body {
     flex-direction: column;
     align-items: flex-start;
     gap: 1.5rem;
+  }
+
+  .header-left {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1rem;
   }
 
   .title-main {
@@ -497,10 +600,15 @@ body {
 
   .stats {
     gap: 1.5rem;
+    flex-wrap: wrap;
   }
 
   .docs-link {
     width: 100%;
     justify-content: center;
+  }
+
+  .gateway-status {
+    width: 100%;
   }
 }

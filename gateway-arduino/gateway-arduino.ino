@@ -339,18 +339,6 @@ void loop() {
   // Process Matter events
   processMatterEvents();
 
-  // Example: Simulate sensor data every 10 seconds
-  static unsigned long lastSensorRead = 0;
-  if (now - lastSensorRead > 10000) {
-    lastSensorRead = now;
-    
-    // Simulate temperature and humidity readings
-    float temp = 20.0 + (random(0, 100) / 10.0);
-    float humidity = 40.0 + (random(0, 200) / 10.0);
-    
-    sendSensorData("sensor_01", temp, humidity);
-  }
-
   delay(10);  // Small delay to prevent watchdog issues
 }
 

@@ -524,13 +524,27 @@ body {
   padding-top: 1rem;
   border-top: 1px solid var(--border);
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
 }
 
 .timestamp {
   font-size: 0.75rem;
   color: var(--text-muted);
   font-family: 'JetBrains Mono', monospace;
+}
+
+.view-history-btn {
+  font-size: 0.75rem;
+  color: var(--accent-secondary);
+  text-decoration: none;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.view-history-btn:hover {
+  color: var(--accent-primary);
+  transform: translateX(4px);
 }
 
 /* Responsive */

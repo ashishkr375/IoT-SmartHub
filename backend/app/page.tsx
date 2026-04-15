@@ -27,10 +27,21 @@ export default function Home() {
     try {
       const res = await fetch("/api/devices");
       const data = await res.json();
-      setDevices(data);
+      
+      // Group by device_id and keep only the latest entry for each device
+      const deviceMap = new Map<string, Device>();
+      data.forEach((device: Device) => {
+        const existing = deviceMap.get(device.device_id);
+        if (!existing || new Date(device.timestamp) > new Date(existing.timestamp)) {
+          deviceMap.set(device.device_id, device);
+        }
+      });
+      
+      const uniqueDevices = Array.from(deviceMap.values());
+      setDevices(uniqueDevices);
       
       // Check for gateway heartbeat
-      checkGatewayStatus(data);
+      checkGatewayStatus(uniqueDevices);
     } catch (error) {
       console.error("Failed to fetch devices:", error);
     } finally {
@@ -203,6 +214,9 @@ export default function Home() {
                     <span className="timestamp">
                       {new Date(device.timestamp).toLocaleTimeString()}
                     </span>
+                    <a href={`/device/${device.device_id}`} className="view-history-btn">
+                      View History →
+                    </a>
                   </div>
                 </div>
               );

@@ -52,14 +52,15 @@ export async function GET(req: Request) {
 
     await connectDB();
 
-    // Fetch pending commands for this device or gateway
-    const commands = await Command.find({
-      $or: [
-        { device_id },
-        { device_id: { $regex: ".*" } }  // Gateway can fetch all commands
-      ],
-      status: "pending"
-    }).sort({ created_at: 1 }).limit(10);
+    // Gateway polls all commands; devices can poll only their own.
+    const isGatewayPoll = device_id.toLowerCase().includes("gateway");
+    const filter = isGatewayPoll
+      ? { status: "pending" }
+      : { device_id, status: "pending" };
+
+    const commands = await Command.find(filter)
+      .sort({ created_at: 1 })
+      .limit(10);
 
     // Mark commands as delivered
     if (commands.length > 0) {

@@ -57,7 +57,7 @@ const char *GATEWAY_DEVICE_ID = "gateway_01";
 // ============================================================
 
 const uint32_t HEARTBEAT_INTERVAL = 30000;
-const uint32_t COMMAND_POLL_INTERVAL = 5000;
+const uint32_t COMMAND_POLL_INTERVAL = 1000;
 const uint32_t BLE_SCAN_INTERVAL = 15000;
 const uint32_t BLE_SCAN_DURATION_MS = 5000; // NimBLE 2.x uses milliseconds!
 const uint32_t MDNS_REFRESH_INTERVAL = 60000;
@@ -348,7 +348,7 @@ void pollCommands()
   String url = String(API_BASE_URL) + API_COMMAND_ENDPOINT + "?device_id=" + GATEWAY_DEVICE_ID;
 
   http.begin(url);
-  http.setTimeout(8000);
+  http.setTimeout(2500);
   int code = http.GET();
 
   if (code != 200)

@@ -1,405 +1,701 @@
 /*
- * Smart Home Gateway - ESP32-S3
- * Matter Controller + HTTPS Bridge
- * 
- * Architecture:
- * Matter Devices → ESP32-S3 Gateway → HTTPS → Next.js Backend → MongoDB → Dashboard
- * 
- * Required Libraries (Install via Arduino Library Manager):
- * - ArduinoJson by Benoit Blanchon
- * - WiFi (built-in)
- * - HTTPClient (built-in)
- * 
- * Board: ESP32S3 Dev Module
- * Upload Speed: 921600
- * USB CDC On Boot: Enabled
+ * ============================================================
+ * SmartHub Gateway - ESP32-S3
+ * NimBLE-Arduino 2.x compatible
+ *
+ * FIX LOG (vs previous version):
+ *  1. NimBLEAdvertisedDeviceCallbacks → NimBLEScanCallbacks  (2.x rename)
+ *  2. onResult signature → onResult(const NimBLEAdvertisedDevice*)
+ *  3. MDNS.IP(i) → MDNS.address(i)
+ *  4. NimBLEAddress(const char*) → NimBLEAddress(std::string, type)
+ *  5. writeValue(buf, len) → writeValue(std::string)  (avoids ambiguous overload)
+ *  6. setAdvertisedDeviceCallbacks → setScanCallbacks  (2.x rename)
+ *  7. bleScan->start() — onScanEnd callback handles completion
+ *
+ * Required Libraries (Arduino Library Manager):
+ *   - NimBLE-Arduino  by h2zero   (2.x)
+ *   - ArduinoJson     by Benoit Blanchon
+ *
+ * Board  : ESP32S3 Dev Module
+ * USB CDC On Boot : Enabled
+ * Partition: Huge APP (3MB No OTA)
+ * ============================================================
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <NimBLEDevice.h>
+#include <map>
 
-// ============================================
-// CONFIGURATION - UPDATE THESE VALUES
-// ============================================
+// ============================================================
+// CONFIGURATION — UPDATE THESE
+// ============================================================
 
-// WiFi Configuration
-const char* WIFI_SSID = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char *WIFI_SSID = "Ashish-Personal";
+const char *WIFI_PASSWORD = "ashu@2003";
 
-// Backend API Configuration
-const char* API_BASE_URL = "https://io-t-smart-hub.vercel.app";
-const char* API_UPDATE_ENDPOINT = "/api/device/update";
-const char* API_COMMAND_ENDPOINT = "/api/device/command";
+const char *API_BASE_URL = "https://smarthublite.vercel.app";
+const char *API_UPDATE_ENDPOINT = "/api/device/update";
+const char *API_COMMAND_ENDPOINT = "/api/device/command";
 
-// Device Configuration
-const char* DEVICE_ID = "gateway_01";
+const char *GATEWAY_DEVICE_ID = "gateway_01";
 
-// ============================================
-// GLOBAL OBJECTS
-// ============================================
+// ============================================================
+// BLE UUIDs — must match client devices exactly
+// ============================================================
+
+#define BLE_SERVICE_UUID "0000FFF6-0000-1000-8000-00805F9B34FB"
+#define BLE_CHAR_SSID "0000FFF7-0000-1000-8000-00805F9B34FB"
+#define BLE_CHAR_PASS "0000FFF8-0000-1000-8000-00805F9B34FB"
+#define BLE_CHAR_STATUS "0000FFF9-0000-1000-8000-00805F9B34FB"
+#define BLE_CHAR_COMMAND "0000FFFA-0000-1000-8000-00805F9B34FB"
+
+// ============================================================
+// TIMING
+// ============================================================
+
+const uint32_t HEARTBEAT_INTERVAL = 30000;
+const uint32_t COMMAND_POLL_INTERVAL = 5000;
+const uint32_t BLE_SCAN_INTERVAL = 15000;
+const uint32_t BLE_SCAN_DURATION_MS = 5000; // NimBLE 2.x uses milliseconds!
+const uint32_t MDNS_REFRESH_INTERVAL = 60000;
+
+// ============================================================
+// DEVICE REGISTRY
+// ============================================================
+
+struct DeviceInfo
+{
+  String ip;
+  String mac;
+  String deviceType;
+  unsigned long lastSeen;
+  bool commissioned;
+};
+
+std::map<String, DeviceInfo> deviceRegistry;
+
+// ============================================================
+// GLOBALS
+// ============================================================
 
 HTTPClient http;
+NimBLEScan *bleScan = nullptr;
+bool bleScanning = false;
+// Device found during scan — connect from loop(), NOT from inside onResult callback
+const NimBLEAdvertisedDevice *pendingDevice = nullptr;
 
 unsigned long lastHeartbeat = 0;
-const long HEARTBEAT_INTERVAL = 30000;  // 30 seconds
-
 unsigned long lastCommandPoll = 0;
-const long COMMAND_POLL_INTERVAL = 5000;  // 5 seconds
+unsigned long lastBLEScan = 0;
+unsigned long lastMDNSRefresh = 0;
 
-// ============================================
-// WIFI FUNCTIONS
-// ============================================
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
 
-void setupWiFi() {
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+void commissionDeviceViaBLE(const NimBLEAdvertisedDevice *device);
+void controlDeviceViaHTTP(const String &ip, const String &deviceId, JsonObject command);
+void controlDeviceViaBLE(const String &deviceId, JsonObject command);
+void processCommand(JsonObject cmd);
+void pollCommands();
+void sendStatusUpdate(const char *status);
+bool sendHTTPPost(const char *endpoint, const char *payload);
+void discoverMDNSDevices();
+void processMatterEvents();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+// ============================================================
+// BLE SCAN CALLBACKS — NimBLE 2.x API
+// FIX 1+2: extends NimBLEScanCallbacks, onResult takes const ptr
+// ============================================================
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+class GatewayScanCallbacks : public NimBLEScanCallbacks
+{
+public:
+  void onResult(const NimBLEAdvertisedDevice *device) override
+  {
+    if (!device->isAdvertisingService(NimBLEUUID(BLE_SERVICE_UUID)))
+    {
+      return;
+    }
+
+    String mac = String(device->getAddress().toString().c_str());
+
+    Serial.println("───────────────────────────────────────");
+    Serial.println("[BLE] SmartHub device found!");
+    Serial.println("  MAC : " + mac);
+    Serial.println("  Name: " + String(device->getName().c_str()));
+    Serial.printf("  RSSI: %d dBm\n", device->getRSSI());
+    Serial.println("───────────────────────────────────────");
+
+    for (auto &kv : deviceRegistry)
+    {
+      if (kv.second.mac == mac && kv.second.commissioned)
+      {
+        kv.second.lastSeen = millis();
+        Serial.println("[BLE] Already commissioned: " + kv.first);
+        return;
+      }
+    }
+
+    // Save pointer and let loop() handle connection outside scan context
+    pendingDevice = device;
+    NimBLEDevice::getScan()->stop();
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  // FIX 7: onScanEnd replaces the old start() lambda
+  void onScanEnd(const NimBLEScanResults &results, int reason) override
+  {
+    Serial.printf("[BLE] Scan ended — %d device(s). Reason=%d\n",
+                  results.getCount(), reason);
+    bleScanning = false;
+  }
+};
+
+// ============================================================
+// BLE COMMISSIONING
+// ============================================================
+
+void commissionDeviceViaBLE(const NimBLEAdvertisedDevice *device)
+{
+  String mac = String(device->getAddress().toString().c_str());
+  Serial.println("[Commission] Starting for: " + mac);
+
+  // Give BLE radio time to fully exit scan mode before connecting
+  delay(500);
+
+  NimBLEClient *client = NimBLEDevice::createClient();
+  client->setConnectionParams(12, 12, 0, 51);
+  // NimBLE 2.x: setConnectTimeout is in MILLISECONDS
+  client->setConnectTimeout(10000); // 10 seconds
+
+  // Retry connect up to 3 times
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3; attempt++)
+  {
+    Serial.printf("[Commission] Connect attempt %d/3...\n", attempt);
+    if (client->connect(device))
+    {
+      connected = true;
+      break;
+    }
+    Serial.println("[Commission] Retrying in 1s...");
+    delay(1000);
+  }
+
+  if (!connected)
+  {
+    Serial.println("[Commission] ❌ BLE connect failed after 3 attempts");
+    NimBLEDevice::deleteClient(client);
+    return;
+  }
+  Serial.println("[Commission] ✅ BLE connected");
+
+  NimBLERemoteService *svc = client->getService(BLE_SERVICE_UUID);
+  if (!svc)
+  {
+    Serial.println("[Commission] ❌ Service not found");
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return;
+  }
+
+  // Write SSID — FIX 5: std::string overload avoids ambiguous writeValue(buf,len)
+  NimBLERemoteCharacteristic *ssidChar = svc->getCharacteristic(BLE_CHAR_SSID);
+  if (ssidChar && ssidChar->canWrite())
+  {
+    ssidChar->writeValue(std::string(WIFI_SSID));
+    Serial.println("[Commission] → SSID sent");
+  }
+
+  // Write Password
+  NimBLERemoteCharacteristic *passChar = svc->getCharacteristic(BLE_CHAR_PASS);
+  if (passChar && passChar->canWrite())
+  {
+    passChar->writeValue(std::string(WIFI_PASSWORD));
+    Serial.println("[Commission] → Password sent");
+  }
+
+  // Poll status char until device reports IP
+  Serial.println("[Commission] Waiting for device WiFi...");
+  NimBLERemoteCharacteristic *statusChar = svc->getCharacteristic(BLE_CHAR_STATUS);
+
+  String deviceId = "";
+  String deviceIp = "";
+  String deviceType = "unknown";
+
+  if (statusChar && statusChar->canRead())
+  {
+    for (int i = 0; i < 24; i++)
+    {
+      delay(1000);
+      Serial.print(".");
+      String val = String(statusChar->readValue().c_str());
+
+      if (val.length() > 4)
+      {
+        StaticJsonDocument<256> jdoc;
+        if (!deserializeJson(jdoc, val))
+        {
+          deviceId = jdoc["device_id"] | "";
+          deviceIp = jdoc["ip"] | "";
+          deviceType = jdoc["type"] | "unknown";
+          if (deviceId.length() > 0 && deviceIp.length() > 0)
+          {
+            Serial.println();
+            Serial.println("[Commission] ✅ Confirmed!");
+            Serial.println("  device_id: " + deviceId);
+            Serial.println("  ip       : " + deviceIp);
+            Serial.println("  type     : " + deviceType);
+            break;
+          }
+        }
+      }
+    }
     Serial.println();
-    Serial.println("WiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Signal strength (RSSI): ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-  } else {
-    Serial.println();
-    Serial.println("WiFi connection failed!");
+  }
+
+  client->disconnect();
+  NimBLEDevice::deleteClient(client);
+
+  if (deviceId.length() == 0)
+  {
+    Serial.println("[Commission] ❌ No confirmation — aborting");
+    return;
+  }
+
+  // Register
+  DeviceInfo info;
+  info.ip = deviceIp;
+  info.mac = mac;
+  info.deviceType = deviceType;
+  info.lastSeen = millis();
+  info.commissioned = true;
+  deviceRegistry[deviceId] = info;
+  Serial.println("[Commission] ✅ Registered: " + deviceId);
+
+  // Notify cloud
+  StaticJsonDocument<256> payload;
+  payload["device_id"] = deviceId;
+  payload["data"]["status"] = "commissioned";
+  payload["data"]["ip"] = deviceIp;
+  payload["data"]["type"] = deviceType;
+  payload["data"]["gateway"] = GATEWAY_DEVICE_ID;
+  char buf[256];
+  serializeJson(payload, buf);
+  sendHTTPPost(API_UPDATE_ENDPOINT, buf);
+}
+
+// ============================================================
+// mDNS DISCOVERY
+// ============================================================
+
+void discoverMDNSDevices()
+{
+  Serial.println("[mDNS] Querying _smarthub._tcp...");
+  int count = MDNS.queryService("smarthub", "tcp");
+  if (count == 0)
+    count = MDNS.queryService("matter", "tcp");
+  Serial.printf("[mDNS] Found %d device(s)\n", count);
+
+  for (int i = 0; i < count; i++)
+  {
+    String host = MDNS.hostname(i);
+
+    // FIX 3: address() replaces IP() in ESP32 Arduino Core 3.x
+    String ip = MDNS.address(i).toString();
+
+    String deviceId = "";
+    String devType = "unknown";
+
+    for (int t = 0; t < MDNS.numTxt(i); t++)
+    {
+      String key = MDNS.txtKey(i, t);
+      String val = MDNS.txt(i, t);
+      if (key == "device_id")
+        deviceId = val;
+      if (key == "type")
+        devType = val;
+    }
+    if (deviceId.length() == 0)
+      deviceId = host;
+
+    Serial.printf("[mDNS] %s → %s\n", deviceId.c_str(), ip.c_str());
+
+    if (deviceRegistry.find(deviceId) == deviceRegistry.end())
+    {
+      DeviceInfo info;
+      info.commissioned = true;
+      info.deviceType = devType;
+      deviceRegistry[deviceId] = info;
+    }
+    deviceRegistry[deviceId].ip = ip;
+    deviceRegistry[deviceId].lastSeen = millis();
   }
 }
 
-// ============================================
-// HTTP API FUNCTIONS
-// ============================================
+// ============================================================
+// COMMAND POLLING
+// ============================================================
 
-bool sendHTTPPost(const char* endpoint, const char* jsonPayload) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected");
-    return false;
+void pollCommands()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  String url = String(API_BASE_URL) + API_COMMAND_ENDPOINT + "?device_id=" + GATEWAY_DEVICE_ID;
+
+  http.begin(url);
+  http.setTimeout(8000);
+  int code = http.GET();
+
+  if (code != 200)
+  {
+    if (code > 0)
+      Serial.printf("[Poll] HTTP %d\n", code);
+    http.end();
+    return;
   }
 
-  String url = String(API_BASE_URL) + String(endpoint);
-  
+  String body = http.getString();
+  http.end();
+
+  if (body.length() < 3 || body == "[]" || body == "{}")
+    return;
+  Serial.println("[Poll] Commands: " + body);
+
+  StaticJsonDocument<2048> doc;
+  if (deserializeJson(doc, body))
+    return;
+
+  if (doc.is<JsonArray>())
+  {
+    for (JsonObject cmd : doc.as<JsonArray>())
+      processCommand(cmd);
+  }
+  else if (doc.is<JsonObject>())
+  {
+    processCommand(doc.as<JsonObject>());
+  }
+}
+
+void processCommand(JsonObject cmd)
+{
+  const char *targetId = cmd["device_id"];
+  JsonObject command = cmd["command"];
+  if (!targetId || command.isNull())
+    return;
+
+  const char *action = command["action"] | "unknown";
+  Serial.printf("[Command] → %s | action=%s\n", targetId, action);
+
+  // Gateway itself
+  if (strcmp(targetId, GATEWAY_DEVICE_ID) == 0)
+  {
+    if (strcmp(action, "status") == 0)
+      sendStatusUpdate("online");
+    else if (strcmp(action, "restart") == 0)
+    {
+      sendStatusUpdate("restarting");
+      delay(500);
+      ESP.restart();
+    }
+    else if (strcmp(action, "scan") == 0)
+      lastBLEScan = 0;
+    else if (strcmp(action, "list_devices") == 0)
+    {
+      StaticJsonDocument<1024> reg;
+      JsonArray arr = reg.createNestedArray("devices");
+      for (auto &kv : deviceRegistry)
+      {
+        JsonObject d = arr.createNestedObject();
+        d["device_id"] = kv.first;
+        d["ip"] = kv.second.ip;
+        d["type"] = kv.second.deviceType;
+      }
+      StaticJsonDocument<1024> upd;
+      upd["device_id"] = GATEWAY_DEVICE_ID;
+      upd["data"] = reg.as<JsonObject>();
+      char buf[1024];
+      serializeJson(upd, buf);
+      sendHTTPPost(API_UPDATE_ENDPOINT, buf);
+    }
+    return;
+  }
+
+  // Forward to child device
+  auto it = deviceRegistry.find(String(targetId));
+  if (it == deviceRegistry.end())
+  {
+    Serial.printf("[Command] ⚠️  Unknown: %s\n", targetId);
+    return;
+  }
+
+  if (it->second.ip.length() > 0)
+  {
+    controlDeviceViaHTTP(it->second.ip, String(targetId), command);
+  }
+  else
+  {
+    controlDeviceViaBLE(String(targetId), command);
+  }
+}
+
+// ============================================================
+// DEVICE CONTROL — HTTP (fast path, device on same WiFi)
+// ============================================================
+
+void controlDeviceViaHTTP(const String &ip, const String &deviceId, JsonObject command)
+{
+  String url = "http://" + ip + "/command";
+
+  StaticJsonDocument<256> payload;
+  payload["device_id"] = deviceId;
+  payload["command"] = command;
+  char buf[256];
+  serializeJson(payload, buf);
+
+  Serial.printf("[HTTP→Dev] %s | %s\n", deviceId.c_str(), buf);
+
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  
-  int httpResponseCode = http.POST(jsonPayload);
-  
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    Serial.print("HTTP Response code: ");
-    Serial.println(httpResponseCode);
-    Serial.print("Response: ");
-    Serial.println(response);
-    http.end();
-    return true;
-  } else {
-    Serial.print("HTTP Error code: ");
-    Serial.println(httpResponseCode);
-    http.end();
+  http.setTimeout(5000);
+  int code = http.POST(buf);
+
+  if (code > 0)
+  {
+    Serial.printf("[HTTP→Dev] %d: %s\n", code, http.getString().c_str());
+  }
+  else
+  {
+    Serial.printf("[HTTP→Dev] ❌ %s\n", http.errorToString(code).c_str());
+    deviceRegistry[deviceId].ip = ""; // clear stale IP, will retry BLE
+  }
+  http.end();
+}
+
+// ============================================================
+// DEVICE CONTROL — BLE (fallback, device not on WiFi yet)
+// ============================================================
+
+void controlDeviceViaBLE(const String &deviceId, JsonObject command)
+{
+  auto it = deviceRegistry.find(deviceId);
+  if (it == deviceRegistry.end() || it->second.mac.length() == 0)
+    return;
+
+  // FIX 4: NimBLEAddress requires (std::string, uint8_t type) in 2.x
+  NimBLEAddress addr(std::string(it->second.mac.c_str()), BLE_ADDR_PUBLIC);
+
+  NimBLEClient *client = NimBLEDevice::createClient();
+  client->setConnectTimeout(8);
+  if (!client->connect(addr))
+  {
+    Serial.println("[BLE→Dev] ❌ " + deviceId);
+    NimBLEDevice::deleteClient(client);
+    return;
+  }
+
+  NimBLERemoteService *svc = client->getService(BLE_SERVICE_UUID);
+  if (svc)
+  {
+    NimBLERemoteCharacteristic *cmdChar = svc->getCharacteristic(BLE_CHAR_COMMAND);
+    if (cmdChar && cmdChar->canWrite())
+    {
+      char buf[256];
+      serializeJson(command, buf);
+      cmdChar->writeValue(std::string(buf)); // FIX 5
+      Serial.println("[BLE→Dev] ✅ " + deviceId);
+    }
+  }
+
+  client->disconnect();
+  NimBLEDevice::deleteClient(client);
+}
+
+// ============================================================
+// HTTP HELPERS
+// ============================================================
+
+bool sendHTTPPost(const char *endpoint, const char *payload)
+{
+  if (WiFi.status() != WL_CONNECTED)
     return false;
-  }
-}
-
-String fetchCommands() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return "";
-  }
-
-  String url = String(API_BASE_URL) + String(API_COMMAND_ENDPOINT) + "?device_id=" + String(DEVICE_ID);
-  
+  String url = String(API_BASE_URL) + endpoint;
   http.begin(url);
-  int httpResponseCode = http.GET();
-  
-  if (httpResponseCode == 200) {
-    String response = http.getString();
-    http.end();
-    return response;
-  } else {
-    http.end();
-    return "";
-  }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  int code = http.POST(payload);
+  Serial.printf("[HTTP] POST %s → %d\n", endpoint, code);
+  http.end();
+  return (code >= 200 && code < 300);
 }
 
-void handleCommand(const char* json) {
-  StaticJsonDocument<512> doc;
-  DeserializationError error = deserializeJson(doc, json);
-
-  if (error) {
-    Serial.print("JSON parse error: ");
-    Serial.println(error.c_str());
-    return;
-  }
-
-  const char* deviceId = doc["device_id"];
-  JsonObject command = doc["command"];
-
-  if (!deviceId || command.isNull()) {
-    Serial.println("Invalid command format");
-    return;
-  }
-
-  Serial.print("Command for device: ");
-  Serial.println(deviceId);
-
-  // Check if command is for this gateway
-  if (strcmp(deviceId, DEVICE_ID) == 0) {
-    const char* action = command["action"];
-    
-    if (action) {
-      Serial.print("Executing action: ");
-      Serial.println(action);
-
-      // Handle different actions
-      if (strcmp(action, "toggle") == 0) {
-        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-        sendStatusUpdate("toggled");
-      } else if (strcmp(action, "status") == 0) {
-        sendStatusUpdate("online");
-      } else if (strcmp(action, "restart") == 0) {
-        Serial.println("Restarting...");
-        delay(1000);
-        ESP.restart();
-      }
-    }
-  } else {
-    // Forward command to Matter device
-    Serial.print("Forwarding command to Matter device: ");
-    Serial.println(deviceId);
-    controlMatterDevice(deviceId, command);
-  }
-}
-
-void pollCommands() {
-  String response = fetchCommands();
-  
-  if (response.length() > 0) {
-    Serial.println("Received commands:");
-    Serial.println(response);
-    
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, response);
-    
-    if (!error && doc.is<JsonArray>()) {
-      JsonArray commands = doc.as<JsonArray>();
-      for (JsonObject cmd : commands) {
-        char buffer[512];
-        serializeJson(cmd, buffer);
-        handleCommand(buffer);
-      }
-    } else if (!error) {
-      char buffer[512];
-      serializeJson(doc, buffer);
-      handleCommand(buffer);
-    }
-  }
-}
-
-// ============================================
-// DEVICE FUNCTIONS
-// ============================================
-
-void sendStatusUpdate(const char* status) {
+void sendStatusUpdate(const char *status)
+{
   StaticJsonDocument<256> doc;
-  doc["device_id"] = DEVICE_ID;
-  
-  JsonObject data = doc.createNestedObject("data");
-  data["status"] = status;
-  data["uptime"] = millis() / 1000;
-  data["rssi"] = WiFi.RSSI();
-  data["ip"] = WiFi.localIP().toString();
-  data["free_heap"] = ESP.getFreeHeap();
-
-  char buffer[256];
-  serializeJson(doc, buffer);
-  
-  sendHTTPPost(API_UPDATE_ENDPOINT, buffer);
+  doc["device_id"] = GATEWAY_DEVICE_ID;
+  doc["data"]["status"] = status;
+  doc["data"]["uptime"] = millis() / 1000;
+  doc["data"]["rssi"] = WiFi.RSSI();
+  doc["data"]["ip"] = WiFi.localIP().toString();
+  doc["data"]["free_heap"] = ESP.getFreeHeap();
+  doc["data"]["devices"] = (int)deviceRegistry.size();
+  char buf[512];
+  serializeJson(doc, buf);
+  sendHTTPPost(API_UPDATE_ENDPOINT, buf);
 }
 
-void sendSensorData(const char* deviceId, float temperature, float humidity) {
-  StaticJsonDocument<256> doc;
-  doc["device_id"] = deviceId;
-  
-  JsonObject data = doc.createNestedObject("data");
-  data["temperature"] = temperature;
-  data["humidity"] = humidity;
-  data["timestamp"] = millis();
+// ============================================================
+// WIFI
+// ============================================================
 
-  char buffer[256];
-  serializeJson(doc, buffer);
-  
-  sendHTTPPost(API_UPDATE_ENDPOINT, buffer);
-}
-
-void sendGenericUpdate(const char* deviceId, const char* rawJson) {
-  StaticJsonDocument<512> doc;
-  doc["device_id"] = deviceId;
-  
-  // Parse raw JSON and add as data
-  StaticJsonDocument<256> dataDoc;
-  DeserializationError error = deserializeJson(dataDoc, rawJson);
-  
-  if (!error) {
-    doc["data"] = dataDoc.as<JsonObject>();
-  } else {
-    doc["data"]["raw"] = rawJson;
+void setupWiFi()
+{
+  Serial.print("[WiFi] Connecting to " + String(WIFI_SSID));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries++ < 40)
+  {
+    delay(500);
+    Serial.print(".");
   }
-
-  char buffer[512];
-  serializeJson(doc, buffer);
-  
-  sendHTTPPost(API_UPDATE_ENDPOINT, buffer);
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("[WiFi] ✅ IP: " + WiFi.localIP().toString());
+  }
+  else
+  {
+    Serial.println("[WiFi] ❌ Failed");
+  }
 }
 
-void sendMatterDeviceUpdate(const char* deviceId, JsonObject attributes) {
-  StaticJsonDocument<512> doc;
-  doc["device_id"] = deviceId;
-  doc["data"] = attributes;
-  doc["timestamp"] = millis();
-
-  char buffer[512];
-  serializeJson(doc, buffer);
-  
-  sendHTTPPost(API_UPDATE_ENDPOINT, buffer);
-}
-
-// ============================================
+// ============================================================
 // SETUP
-// ============================================
+// ============================================================
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(1000);
-  
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println("ESP32-S3 Smart Home Gateway");
-  Serial.println("Matter Controller + HTTPS Bridge");
-  Serial.println("========================================");
 
-  // Setup built-in LED
+  Serial.println();
+  Serial.println("╔══════════════════════════════════════╗");
+  Serial.println("║   SmartHub Gateway  -  ESP32-S3      ║");
+  Serial.println("║   NimBLE 2.x  |  ArduinoJson         ║");
+  Serial.println("╚══════════════════════════════════════╝");
+
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  // Connect to WiFi
   setupWiFi();
 
-  // Initialize Matter stack
-  initializeMatter();
+  // mDNS
+  if (MDNS.begin("smarthub-gateway"))
+  {
+    MDNS.addService("smarthub", "tcp", 80);
+    Serial.println("[mDNS] ✅ smarthub-gateway.local");
+  }
 
-  // Send online status
-  if (WiFi.status() == WL_CONNECTED) {
+  // BLE — FIX 6: setScanCallbacks (was setAdvertisedDeviceCallbacks)
+  NimBLEDevice::init("SmartHub-GW");
+  NimBLEDevice::setPower(9); // 2.x: plain dBm int, not ESP_PWR_LVL_P9
+
+  bleScan = NimBLEDevice::getScan();
+  bleScan->setScanCallbacks(new GatewayScanCallbacks(), false);
+  bleScan->setActiveScan(true);
+  bleScan->setInterval(100);
+  bleScan->setWindow(99);
+  Serial.println("[BLE] ✅ Scanner ready");
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    discoverMDNSDevices();
     sendStatusUpdate("online");
   }
 
-  Serial.println("Setup complete!");
-  Serial.println("Backend: " + String(API_BASE_URL));
-  Serial.println("========================================");
+  Serial.println("[Setup] ✅ Gateway ready — " + String(API_BASE_URL));
+  Serial.println("════════════════════════════════════════");
 }
 
-// ============================================
-// MAIN LOOP
-// ============================================
+// ============================================================
+// LOOP
+// ============================================================
 
-void loop() {
-  // Maintain WiFi connection
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected, reconnecting...");
+void loop()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[WiFi] Lost — reconnecting...");
+    WiFi.disconnect();
+    delay(1000);
     setupWiFi();
     return;
   }
 
   unsigned long now = millis();
 
-  // Poll for commands from backend
-  if (now - lastCommandPoll > COMMAND_POLL_INTERVAL) {
+  if (now - lastCommandPoll >= COMMAND_POLL_INTERVAL)
+  {
     lastCommandPoll = now;
     pollCommands();
   }
 
-  // Send heartbeat
-  if (now - lastHeartbeat > HEARTBEAT_INTERVAL) {
+  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL)
+  {
     lastHeartbeat = now;
     sendStatusUpdate("heartbeat");
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
-  // Process Matter events
+  // Commission pending device (pointer saved from scan callback, connect in loop)
+  if (pendingDevice != nullptr)
+  {
+    const NimBLEAdvertisedDevice *dev = pendingDevice;
+    pendingDevice = nullptr; // clear before commission so scan can resume after
+    commissionDeviceViaBLE(dev);
+  }
+
+  // NimBLE 2.x: start() takes MILLISECONDS not seconds
+  if (!bleScanning && pendingDevice == nullptr && (now - lastBLEScan >= BLE_SCAN_INTERVAL))
+  {
+    lastBLEScan = now;
+    bleScanning = true;
+    Serial.println("[BLE] Starting scan...");
+    bleScan->start(BLE_SCAN_DURATION_MS); // 5000ms = 5 seconds
+  }
+
+  if (now - lastMDNSRefresh >= MDNS_REFRESH_INTERVAL)
+  {
+    lastMDNSRefresh = now;
+    discoverMDNSDevices();
+  }
+
   processMatterEvents();
-
-  delay(10);  // Small delay to prevent watchdog issues
+  delay(10);
 }
 
-// ============================================
-// MATTER FUNCTIONS
-// ============================================
+// ============================================================
+// SENSOR SIMULATION (remove once real devices connected)
+// ============================================================
 
-void initializeMatter() {
-  Serial.println("Initializing Matter stack...");
-  
-  // Initialize Matter/CHIP controller
-  // This will be implemented with actual Matter SDK
-  
-  Serial.println("Matter stack initialized");
-  Serial.println("Ready for device commissioning");
-}
-
-void processMatterEvents() {
-  // Poll Matter stack for events
-  // When a Matter device sends an update, forward it to backend
-  
-  // Example: If Matter device "fan_01" reports speed change
-  // StaticJsonDocument<256> doc;
-  // doc["speed"] = 75;
-  // doc["power"] = true;
-  // sendMatterDeviceUpdate("fan_01", doc.as<JsonObject>());
-}
-
-void commissionMatterDevice() {
-  Serial.println("Starting Matter commissioning...");
-  Serial.println("1. Enable BLE on device");
-  Serial.println("2. Scan for devices");
-  Serial.println("3. Send WiFi credentials via BLE");
-  Serial.println("4. Device joins Matter fabric");
-  Serial.println("5. Device becomes discoverable via mDNS");
-  
-  // Actual implementation will use Matter SDK
-}
-
-void discoverMatterDevices() {
-  Serial.println("Discovering Matter devices via mDNS...");
-  
-  // Use mDNS to find commissioned devices
-  // Register them internally
-}
-
-void controlMatterDevice(const char* deviceId, JsonObject command) {
-  Serial.print("Controlling Matter device: ");
-  Serial.println(deviceId);
-  
-  // Map command to Matter cluster/attribute
-  // Example: {"action": "toggle"} → OnOff cluster toggle command
-  
-  const char* action = command["action"];
-  
-  if (action) {
-    Serial.print("Action: ");
-    Serial.println(action);
-    
-    // Send Matter command to device
-    // Device will respond with updated state
-    // Forward that state to backend via sendMatterDeviceUpdate()
+void processMatterEvents()
+{
+  static unsigned long lastSim = 0;
+  if (millis() - lastSim > 10000)
+  {
+    lastSim = millis();
+    StaticJsonDocument<256> doc;
+    doc["device_id"] = "sensor_01";
+    doc["data"]["temperature"] = 20.0f + (random(0, 100) / 10.0f);
+    doc["data"]["humidity"] = 40.0f + (random(0, 200) / 10.0f);
+    doc["data"]["simulated"] = true;
+    char buf[256];
+    serializeJson(doc, buf);
+    sendHTTPPost(API_UPDATE_ENDPOINT, buf);
   }
 }

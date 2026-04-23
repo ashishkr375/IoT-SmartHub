@@ -28,20 +28,11 @@ export default function Home() {
       const res = await fetch("/api/devices");
       const data = await res.json();
       
-      // Group by device_id and keep only the latest entry for each device
-      const deviceMap = new Map<string, Device>();
-      data.forEach((device: Device) => {
-        const existing = deviceMap.get(device.device_id);
-        if (!existing || new Date(device.timestamp) > new Date(existing.timestamp)) {
-          deviceMap.set(device.device_id, device);
-        }
-      });
-      
-      const uniqueDevices = Array.from(deviceMap.values());
-      setDevices(uniqueDevices);
+      // API now returns unique devices (latest record per device_id)
+      setDevices(data);
       
       // Check for gateway heartbeat
-      checkGatewayStatus(uniqueDevices);
+      checkGatewayStatus(data);
     } catch (error) {
       console.error("Failed to fetch devices:", error);
     } finally {

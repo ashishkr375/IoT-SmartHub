@@ -37,9 +37,32 @@ export async function GET() {
   try {
     await connectDB();
 
-    const devices = await Device.find()
-      .sort({ timestamp: -1 })
-      .limit(100);
+    // Get the latest record for each unique device_id using aggregation
+    const devices = await Device.aggregate([
+      {
+        $sort: { timestamp: -1 }
+      },
+      {
+        $group: {
+          _id: "$device_id",
+          device_id: { $first: "$device_id" },
+          data: { $first: "$data" },
+          timestamp: { $first: "$timestamp" },
+          doc_id: { $first: "$_id" }
+        }
+      },
+      {
+        $project: {
+          _id: "$doc_id",
+          device_id: 1,
+          data: 1,
+          timestamp: 1
+        }
+      },
+      {
+        $sort: { timestamp: -1 }
+      }
+    ]);
 
     return NextResponse.json(devices);
   } catch (error) {

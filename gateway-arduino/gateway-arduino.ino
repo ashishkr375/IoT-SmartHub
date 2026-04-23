@@ -3,15 +3,6 @@
  * SmartHub Gateway - ESP32-S3
  * NimBLE-Arduino 2.x compatible
  *
- * FIX LOG (vs previous version):
- *  1. NimBLEAdvertisedDeviceCallbacks → NimBLEScanCallbacks  (2.x rename)
- *  2. onResult signature → onResult(const NimBLEAdvertisedDevice*)
- *  3. MDNS.IP(i) → MDNS.address(i)
- *  4. NimBLEAddress(const char*) → NimBLEAddress(std::string, type)
- *  5. writeValue(buf, len) → writeValue(std::string)  (avoids ambiguous overload)
- *  6. setAdvertisedDeviceCallbacks → setScanCallbacks  (2.x rename)
- *  7. bleScan->start() — onScanEnd callback handles completion
- *
  * Required Libraries (Arduino Library Manager):
  *   - NimBLE-Arduino  by h2zero   (2.x)
  *   - ArduinoJson     by Benoit Blanchon
@@ -24,6 +15,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
 #include <NimBLEDevice.h>
@@ -33,10 +25,39 @@
 // CONFIGURATION — UPDATE THESE
 // ============================================================
 
-const char *WIFI_SSID = "Ashish-Personal";
-const char *WIFI_PASSWORD = "ashu@2003";
+struct WiFiCredentials {
+  const char* ssid;
+  const char* password;
+};
 
+// Add multiple WiFi networks - will try in order until one connects
+WiFiCredentials wifiNetworks[] = {
+  {"Ashish-Personal", "ashu@2003"},
+  {"dlink", ""},
+  {"NITP", "Admin#2024"}
+  // Add more networks as needed
+};
+
+const int WIFI_NETWORK_COUNT = sizeof(wifiNetworks) / sizeof(wifiNetworks[0]);
+int currentWiFiIndex = 0;
+
+// ============================================================
+// API CONFIGURATION
+// Choose ONE of the following options:
+// ============================================================
+
+// OPTION 1: Local Development (Recommended - Most Reliable)
+// Find your computer's IP: Windows: ipconfig | Mac/Linux: ifconfig
+// Then run: cd backend && npm run dev
+// const char *API_BASE_URL = "http://192.168.137.1:3000";  // Update with YOUR computer's IP
+
+// OPTION 2: Vercel Production (HTTPS - May have connection issues on ESP32)
 const char *API_BASE_URL = "https://smarthublite.vercel.app";
+
+// OPTION 3: ngrok Tunnel (For remote testing)
+// Run: ngrok http 3000
+// const char *API_BASE_URL = "https://xxxx-xx-xx-xx-xx.ngrok-free.app";
+
 const char *API_UPDATE_ENDPOINT = "/api/device/update";
 const char *API_COMMAND_ENDPOINT = "/api/device/command";
 
@@ -59,7 +80,7 @@ const char *GATEWAY_DEVICE_ID = "gateway_01";
 const uint32_t HEARTBEAT_INTERVAL = 30000;
 const uint32_t COMMAND_POLL_INTERVAL = 1000;
 const uint32_t BLE_SCAN_INTERVAL = 15000;
-const uint32_t BLE_SCAN_DURATION_MS = 5000; // NimBLE 2.x uses milliseconds!
+const uint32_t BLE_SCAN_DURATION_MS = 5000;
 const uint32_t MDNS_REFRESH_INTERVAL = 60000;
 
 // ============================================================
@@ -82,6 +103,7 @@ std::map<String, DeviceInfo> deviceRegistry;
 // ============================================================
 
 HTTPClient http;
+WiFiClientSecure secureClient;
 NimBLEScan *bleScan = nullptr;
 bool bleScanning = false;
 // Device found during scan — connect from loop(), NOT from inside onResult callback
@@ -108,7 +130,6 @@ void processMatterEvents();
 
 // ============================================================
 // BLE SCAN CALLBACKS — NimBLE 2.x API
-// FIX 1+2: extends NimBLEScanCallbacks, onResult takes const ptr
 // ============================================================
 
 class GatewayScanCallbacks : public NimBLEScanCallbacks
@@ -145,7 +166,6 @@ public:
     NimBLEDevice::getScan()->stop();
   }
 
-  // FIX 7: onScanEnd replaces the old start() lambda
   void onScanEnd(const NimBLEScanResults &results, int reason) override
   {
     Serial.printf("[BLE] Scan ended — %d device(s). Reason=%d\n",
@@ -163,7 +183,7 @@ void commissionDeviceViaBLE(const NimBLEAdvertisedDevice *device)
   String mac = String(device->getAddress().toString().c_str());
   Serial.println("[Commission] Starting for: " + mac);
 
-  // Give BLE radio time to fully exit scan mode before connecting
+  // Given BLE radio time to fully exit scan mode before connecting
   delay(500);
 
   NimBLEClient *client = NimBLEDevice::createClient();
@@ -202,19 +222,22 @@ void commissionDeviceViaBLE(const NimBLEAdvertisedDevice *device)
     return;
   }
 
-  // Write SSID — FIX 5: std::string overload avoids ambiguous writeValue(buf,len)
+  // Send current connected WiFi credentials to device
+  const char* currentSSID = wifiNetworks[currentWiFiIndex].ssid;
+  const char* currentPassword = wifiNetworks[currentWiFiIndex].password;
+  
   NimBLERemoteCharacteristic *ssidChar = svc->getCharacteristic(BLE_CHAR_SSID);
   if (ssidChar && ssidChar->canWrite())
   {
-    ssidChar->writeValue(std::string(WIFI_SSID));
-    Serial.println("[Commission] → SSID sent");
+    ssidChar->writeValue(std::string(currentSSID));
+    Serial.println("[Commission] → SSID sent: " + String(currentSSID));
   }
 
   // Write Password
   NimBLERemoteCharacteristic *passChar = svc->getCharacteristic(BLE_CHAR_PASS);
   if (passChar && passChar->canWrite())
   {
-    passChar->writeValue(std::string(WIFI_PASSWORD));
+    passChar->writeValue(std::string(currentPassword));
     Serial.println("[Commission] → Password sent");
   }
 
@@ -304,7 +327,7 @@ void discoverMDNSDevices()
   {
     String host = MDNS.hostname(i);
 
-    // FIX 3: address() replaces IP() in ESP32 Arduino Core 3.x
+    //address() replaces IP() in ESP32 Arduino Core 3.x
     String ip = MDNS.address(i).toString();
 
     String deviceId = "";
@@ -347,8 +370,15 @@ void pollCommands()
 
   String url = String(API_BASE_URL) + API_COMMAND_ENDPOINT + "?device_id=" + GATEWAY_DEVICE_ID;
 
-  http.begin(url);
-  http.setTimeout(2500);
+  // Check if URL uses HTTPS
+  if (url.startsWith("https://")) {
+    secureClient.setInsecure();
+    http.begin(secureClient, url);
+  } else {
+    http.begin(url);
+  }
+  
+  http.setTimeout(5000);
   int code = http.GET();
 
   if (code != 200)
@@ -521,14 +551,59 @@ void controlDeviceViaBLE(const String &deviceId, JsonObject command)
 
 bool sendHTTPPost(const char *endpoint, const char *payload)
 {
-  if (WiFi.status() != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] ❌ WiFi not connected");
     return false;
+  }
+  
   String url = String(API_BASE_URL) + endpoint;
-  http.begin(url);
+  
+  // Check if URL uses HTTPS
+  if (url.startsWith("https://")) {
+    // Configure secure client for HTTPS
+    Serial.printf("[HTTP] HTTPS mode - connecting to: %s\n", url.c_str());
+    
+    secureClient.setInsecure(); // Skip certificate validation
+    secureClient.setTimeout(20); // 20 second timeout
+    secureClient.setHandshakeTimeout(30); // 30 second handshake timeout
+    
+    if (!http.begin(secureClient, url)) {
+      Serial.println("[HTTP] ❌ Failed to begin HTTPS connection");
+      return false;
+    }
+  } else {
+    // Regular HTTP connection
+    Serial.printf("[HTTP] HTTP mode - connecting to: %s\n", url.c_str());
+    if (!http.begin(url)) {
+      Serial.println("[HTTP] ❌ Failed to begin HTTP connection");
+      return false;
+    }
+  }
+  
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000);
+  http.addHeader("User-Agent", "ESP32-Gateway/1.0");
+  http.setTimeout(20000); // 20 second timeout
+  
+  Serial.printf("[HTTP] Sending payload (%d bytes)...\n", strlen(payload));
   int code = http.POST(payload);
-  Serial.printf("[HTTP] POST %s → %d\n", endpoint, code);
+  
+  if (code <= 0) {
+    Serial.printf("[HTTP] POST %s → ERROR: %s (code: %d)\n", endpoint, http.errorToString(code).c_str(), code);
+    Serial.println("[HTTP] Possible causes:");
+    Serial.println("  - DNS resolution failed");
+    Serial.println("  - TLS handshake timeout");
+    Serial.println("  - Server unreachable");
+    Serial.println("  - Firewall blocking ESP32");
+  } else if (code >= 200 && code < 300) {
+    Serial.printf("[HTTP] POST %s → %d ✅\n", endpoint, code);
+  } else {
+    Serial.printf("[HTTP] POST %s → %d ⚠️\n", endpoint, code);
+    String response = http.getString();
+    if (response.length() > 0 && response.length() < 200) {
+      Serial.println("[HTTP] Response: " + response);
+    }
+  }
+  
   http.end();
   return (code >= 200 && code < 300);
 }
@@ -545,33 +620,88 @@ void sendStatusUpdate(const char *status)
   doc["data"]["devices"] = (int)deviceRegistry.size();
   char buf[512];
   serializeJson(doc, buf);
-  sendHTTPPost(API_UPDATE_ENDPOINT, buf);
+  
+  Serial.println("[Status] Sending: " + String(buf));
+  bool success = sendHTTPPost(API_UPDATE_ENDPOINT, buf);
+  if (!success) {
+    Serial.println("[Status] ❌ Failed to send status update");
+  }
 }
 
 // ============================================================
 // WIFI
 // ============================================================
 
-void setupWiFi()
+bool tryConnectWiFi(int networkIndex)
 {
-  Serial.print("[WiFi] Connecting to " + String(WIFI_SSID));
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  if (networkIndex >= WIFI_NETWORK_COUNT) {
+    return false;
+  }
+
+  const char* ssid = wifiNetworks[networkIndex].ssid;
+  const char* password = wifiNetworks[networkIndex].password;
+
+  Serial.printf("[WiFi] Trying network %d/%d: %s", networkIndex + 1, WIFI_NETWORK_COUNT, ssid);
+  
+  WiFi.begin(ssid, password);
+  
   int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries++ < 40)
-  {
+  while (WiFi.status() != WL_CONNECTED && tries++ < 20) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("[WiFi] ✅ IP: " + WiFi.localIP().toString());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] ✅ Connected to '%s'\n", ssid);
+    Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
+    Serial.printf("[WiFi] RSSI: %d dBm\n", WiFi.RSSI());
+    currentWiFiIndex = networkIndex;
+    return true;
+  } else {
+    Serial.printf("[WiFi] ❌ Failed to connect to '%s'\n", ssid);
+    return false;
   }
-  else
-  {
-    Serial.println("[WiFi] ❌ Failed");
+}
+
+void setupWiFi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false); // We'll handle reconnection manually
+  
+  Serial.println("[WiFi] Starting connection...");
+  
+  // Try each network in order
+  for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+    if (tryConnectWiFi(i)) {
+      return; // Successfully connected
+    }
   }
+  
+  // If we get here, all networks failed
+  Serial.println("[WiFi] ❌ All networks failed");
+}
+
+void reconnectWiFi()
+{
+  Serial.println("[WiFi] Connection lost — attempting reconnect...");
+  WiFi.disconnect();
+  delay(1000);
+  
+  // Try current network first
+  if (tryConnectWiFi(currentWiFiIndex)) {
+    return;
+  }
+  
+  // Try all other networks
+  for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+    if (i == currentWiFiIndex) continue; // Already tried
+    if (tryConnectWiFi(i)) {
+      return;
+    }
+  }
+  
+  Serial.println("[WiFi] ❌ Reconnection failed for all networks");
 }
 
 // ============================================================
@@ -588,6 +718,18 @@ void setup()
   Serial.println("║   SmartHub Gateway  -  ESP32-S3      ║");
   Serial.println("║   NimBLE 2.x  |  ArduinoJson         ║");
   Serial.println("╚══════════════════════════════════════╝");
+  Serial.println();
+  Serial.println("API Endpoint: " + String(API_BASE_URL));
+  
+  if (String(API_BASE_URL).startsWith("https://")) {
+    Serial.println();
+    Serial.println("⚠️  WARNING: Using HTTPS may cause connection issues!");
+    Serial.println("💡 For reliable connection, use local HTTP:");
+    Serial.println("   1. Run: cd backend && npm run dev");
+    Serial.println("   2. Find your IP: ipconfig (Windows) or ifconfig (Mac/Linux)");
+    Serial.println("   3. Update API_BASE_URL to: http://YOUR_IP:3000");
+    Serial.println();
+  }
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
@@ -601,7 +743,7 @@ void setup()
     Serial.println("[mDNS] ✅ smarthub-gateway.local");
   }
 
-  // BLE — FIX 6: setScanCallbacks (was setAdvertisedDeviceCallbacks)
+  //setScanCallbacks (was setAdvertisedDeviceCallbacks)
   NimBLEDevice::init("SmartHub-GW");
   NimBLEDevice::setPower(9); // 2.x: plain dBm int, not ESP_PWR_LVL_P9
 
@@ -630,11 +772,11 @@ void loop()
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("[WiFi] Lost — reconnecting...");
-    WiFi.disconnect();
-    delay(1000);
-    setupWiFi();
-    return;
+    reconnectWiFi();
+    if (WiFi.status() != WL_CONNECTED) {
+      delay(5000); // Wait before trying again
+      return;
+    }
   }
 
   unsigned long now = millis();
